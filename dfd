@@ -1,0 +1,169 @@
+#define _XOPEN_SOURCE 700
+
+#include <errno.h>
+#include <fcntl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/stat.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+#define ERR(source) (perror(source), fprintf(stderr, "%s:%d\n", __FILE__, __LINE__), exit(EXIT_FAILURE))
+
+void ms_sleep(unsigned int milli)
+{
+    struct timespec ts = {milli / 1000, (milli % 1000) * 1000000L};
+    nanosleep(&ts, NULL);
+}
+
+void usage(int argc, char* argv[])
+{
+    printf("%s N M\n", argv[0]);
+    printf("\t10 <= N <= 20 - number of banner threads\n");
+    printf("\t2 <= N <= 8 - number of artillery threads\n");
+    exit(EXIT_FAILURE);
+}
+
+typedef struct
+{
+    int id;
+    sem_t* pass_sem;
+    pthread_mutex_t* ready_mutex;
+    pthread_cond_t* ready_cond;
+    int* can_change;
+} CavalryArgs;
+
+void* cavalry_work(void* arg)
+{
+    CavalryArgs* a = (CavalryArgs*)arg;
+    unsigned int seed = time(NULL);
+    if (sem_wait(a->pass_sem))
+        ERR("sem_wait");
+
+    int travel_time = 80 + rand_r(&seed) % 42;
+    ms_sleep(travel_time);
+    printf("CAVALRY %d IN POSITION\n", a->id);
+    if (sem_post(a->pass_sem))
+        ERR("sem_post");
+
+    pthread_mutex_lock(a->ready_mutex);
+    while (!*a->can_change)
+        pthread_cond_wait(a->ready_cond, a->ready_mutex);
+    pthread_mutex_unlock(a->ready_mutex);
+
+    printf("CAVALRY %d READY TO CHANGE\n", a->id);
+    return NULL;
+}
+
+typedef struct
+{
+    pthread_barrier_t* barrier;
+    pthread_mutex_t* hp_mutex;
+    int* enemy_hp;
+    pthread_cond_t* ready_cond;
+    pthread_mutex_t* ready_mutex;
+    int* can_change;
+} ArtilleryArgs;
+
+void* artillery_work(void* arg)
+{
+    ArtilleryArgs* a = arg;
+    unsigned int seed = time(NULL);
+
+    while (1)
+    {
+        pthread_barrier_wait(a->barrier);
+        ms_sleep(400);
+
+        pthread_mutex_lock(a->hp_mutex);
+        printf("ARTILLERY: ENEMY HP %d\n", *a->enemy_hp);
+
+        int dmg = 1 + rand_r(&seed) % 6;
+        *a->enemy_hp -= dmg;
+        int hp = *a->enemy_hp;
+        pthread_mutex_unlock(a->hp_mutex);
+        if (hp < 50)
+        {
+            pthread_mutex_lock(a->ready_mutex);
+            *a->can_change = 1;
+            pthread_cond_broadcast(a->ready_cond);
+            pthread_mutex_unlock(a->ready_mutex);
+
+            pthread_mutex_unlock(a->hp_mutex);
+            break;
+        }
+
+        pthread_mutex_unlock(a->hp_mutex);
+    }
+}
+int main(int argc, char* argv[])
+{
+    if (argc != 3)
+        usage(argc, argv);
+
+    int N = atoi(argv[1]);
+    int M = atoi(argv[2]);
+
+    if (N < 10 || N > 20 || M < 2 || M > 8)
+        usage(argc, argv);
+    pthread_t cav[N], art[M];
+    CavalryArgs cav_args[N];
+    ArtilleryArgs art_args;
+
+    sem_t pass_sem;
+    if (sem_init(&pass_sem, 0, 3))
+        ERR("sem_init");
+
+    pthread_mutex_t ready_mutex = PTHREAD_MUTEX_INITIALIZER;
+    pthread_cond_t ready_cond = PTHREAD_COND_INITIALIZER;
+    int can_change = 0;
+
+    pthread_mutex_t hp_mutex = PTHREAD_MUTEX_INITIALIZER;
+    int enemy_hp = 100;
+
+    pthread_barrier_t barrier;
+    pthread_barrier_init(&barrier, NULL, M);
+    for (int i = 0; i < N; i++)
+    {
+        cav_args[i] = (CavalryArgs){.id = i,
+                                    .pass_sem = &pass_sem,
+                                    .ready_mutex = &ready_mutex,
+                                    .ready_cond = &ready_cond,
+                                    .can_change = &can_change};
+        pthread_create(&cav[i], NULL, cavalry_work, &cav_args[i]);
+    }
+
+    art_args = (ArtilleryArgs){.barrier = &barrier,
+                               .hp_mutex = &hp_mutex,
+                               .enemy_hp = &enemy_hp,
+                               .ready_cond = &ready_cond,
+                               .ready_mutex = &ready_mutex,
+                               .can_change = &can_change};
+    for (int i = 0; i < M; i++)
+    {
+        pthread_create(&art[i], NULL, artillery_work, &art_args);
+    }
+
+    for (int i = 0; i < N; i++)
+    {
+        if (pthread_join(cav[i], NULL))
+            ERR("pthread_join");
+    }
+    for (int i = 0; i < M; i++)
+    {
+        if (pthread_join(art[i], NULL))
+            ERR("pthread_join");
+    }
+    if (pthread_barrier_destroy(&barrier)) ERR("barrier_destroy");
+    if (pthread_mutex_destroy(&hp_mutex)) ERR("mutex_destroy");
+    if (pthread_mutex_destroy(&ready_mutex)) ERR ("mutex_destroy");
+    if (pthread_cond_destroy(&ready_cond)) ERR("cond destroy");
+
+    if (sem_destroy(&pass_sem))
+        ERR("sem_destroy");
+
+    return EXIT_SUCCESS;
+}
